@@ -8,7 +8,8 @@
 #include "core.h"
 
 void dumpLine(int* values, int nranks, const char* prefix) {
-  constexpr int line_length = 128;
+  // MODIFY zhangzhao: enlarge line buffer for large-scale scale-up simulation (thousands of GPUs)
+  constexpr int line_length = 15 + 6 * 8192;
   char line[line_length];
   int num_width = snprintf(nullptr, 0, "%d", nranks-1);  // safe as per "man snprintf"
   int n = snprintf(line, line_length, "%s", prefix);
@@ -24,6 +25,8 @@ void dumpLine(int* values, int nranks, const char* prefix) {
     snprintf(line+line_length-4, 4, "...");
   }
   INFO(NCCL_INIT, "%s", line);
+  // ADD zhangzhao: also emit ring layout under MOCK_ROOT for simulation analysis
+  INFO(NCCL_MOCK_ROOT, "%s", line);
 }
 
 ncclResult_t ncclBuildRings(int nrings, int* rings, int rank, int nranks, int* prev, int* next) {

@@ -7,6 +7,13 @@
 include ../makefiles/common.mk
 include ../makefiles/version.mk
 
+# ADD
+# Author: zhangzhao
+# Date:
+# Debug flags: enable full debug symbols and disable optimization for simulation debugging.
+CXXFLAGS += -g
+CXXFLAGS += -O0
+
 ##### src files
 INCEXPORTS  := nccl.h nccl_device.h \
 	$(patsubst include/%,%,$(wildcard include/nccl_device/*.h include/nccl_device/*/*.h include/nccl_device/*/*/*.h))

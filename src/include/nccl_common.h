@@ -41,6 +41,12 @@ typedef enum {
   NCCL_REG = 0x2000,
   NCCL_PROFILE = 0x4000,
   NCCL_RAS = 0x8000,
+  // ADD
+  // Author: zhangzhao
+  // Date:
+  // Register MOCK debug subsystem bits for simulation log output (root-only and per-rank).
+  NCCL_MOCK_ROOT = 0x10000,
+  NCCL_MOCK = 0x20000,
   NCCL_ALL = ~0
 } ncclDebugLogSubSys;
 

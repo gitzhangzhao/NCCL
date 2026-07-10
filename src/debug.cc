@@ -132,6 +132,14 @@ static void ncclDebugInit() {
         mask = NCCL_PROFILE;
       } else if (strcasecmp(subsys, "RAS") == 0) {
         mask = NCCL_RAS;
+      // ADD
+      // Author: zhangzhao
+      // Date:
+      // Recognize MOCK_ROOT/MOCK subsystem names for simulation log filtering.
+      } else if (strcasecmp(subsys, "MOCK_ROOT") == 0) {
+        mask = NCCL_MOCK_ROOT;
+      } else if (strcasecmp(subsys, "MOCK") == 0) {
+        mask = NCCL_MOCK;
       } else if (strcasecmp(subsys, "ALL") == 0) {
         mask = NCCL_ALL;
       }
@@ -324,7 +332,11 @@ void ncclDebugLog(ncclDebugLogLevel level, unsigned long flags, const char *file
     tid = ncclOsGetTid();
   }
 
-  char buffer[1024];
+  // MODIFY
+  // Author: zhangzhao
+  // Date:
+  // Expand log buffer from 1024 to 8192 bytes for large-scale topology printing.
+  char buffer[8192];
   size_t len = 0;
 
   // WARNs come with an extra newline at the beginning.
@@ -374,9 +386,13 @@ void ncclDebugLog(ncclDebugLogLevel level, unsigned long flags, const char *file
   }
 
   int cudaDev = 0;
-  if (!(level == NCCL_LOG_TRACE && flags == NCCL_CALL)) {
-    (void)cudaGetDevice(&cudaDev);
-  }
+  // MODIFY
+  // Author: zhangzhao
+  // Date:
+  // Skip cudaGetDevice in simulation mode (no GPU); keep cudaDev fixed at 0.
+  // if (!(level == NCCL_LOG_TRACE && flags == NCCL_CALL)) {
+  //   (void)cudaGetDevice(&cudaDev);
+  // }
 
   // Add level specific formatting. The format string from the call site is incorporated into this prefix.
   if (level == NCCL_LOG_WARN) {
