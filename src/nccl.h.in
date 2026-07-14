@@ -187,8 +187,9 @@ ncclResult_t pncclCommInitRank(ncclComm_t* comm, int nranks, ncclUniqueId commId
  * comm should be pre-allocated with size at least ndev*sizeof(ncclComm_t).
  * If devlist is NULL, the first ndev CUDA devices are used.
  * Order of devlist defines user-order of processors within the communicator. */
-ncclResult_t  ncclCommInitAll(ncclComm_t* comm, int ndev, const int* devlist);
-ncclResult_t pncclCommInitAll(ncclComm_t* comm, int ndev, const int* devlist);
+// MODIFY zhangzhao: add mockOutput parameter (pass NULL for normal use) to export simulation data
+ncclResult_t  ncclCommInitAll(ncclComm_t* comm, int ndev, const int* devlist, void *mockOutput);
+ncclResult_t pncclCommInitAll(ncclComm_t* comm, int ndev, const int* devlist, void *mockOutput);
 
 /* Finalize a communicator. ncclCommFinalize flushes all issued communications,
  * and marks communicator state as ncclInProgress. The state will change to ncclSuccess

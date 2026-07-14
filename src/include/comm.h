@@ -26,6 +26,11 @@
 #include "argcheck.h"
 #include "mem_manager.h"
 
+// ADD zhangzhao: STL containers for mock simulation data export
+#include <map>
+#include <vector>
+#include <string>
+
 #if CUDART_VERSION < 9000
 struct cudaLaunchParams {
   void *func;
@@ -515,6 +520,42 @@ typedef enum ncclCheckMode {
   ncclCheckModeDebugGlobal = 2,
 } ncclCheckMode_t;
 
+// ADD
+// Author: zhangzhao
+// Date:
+// Mock simulation output: exports ring/tree topology, per-collective info, and fine-grained P2P transfer traces
+// for GPU scale-up simulation (consumed by the test harness to produce p2p_trace.csv/txt).
+struct ncclMockOutput {
+    std::string mockName;
+    // ringChannels[channel][rank] = {prev, next, recv, send}
+    std::map<int, std::map<int, std::vector<int>>> ringChannels;
+    // treeChannels[channel][rank] = {up, down[0], down[1], down[2]}
+    std::map<int, std::map<int, std::vector<int>>> treeChannels;
+
+    struct CollInfo {
+        int algo, protocol, nchannels;
+        int chunkSize, chunkCount, chunkSteps;
+        int sliceSteps, stepSize;
+        size_t alignCount, workCount, lastChunkCount;
+        uint32_t steps;
+    };
+
+    std::map<ncclFunc_t, std::map<size_t, CollInfo>> collInfos;
+
+    // per-GPU-pair P2P send record for fine-grained trace
+    struct P2pTransfer {
+        int collective;
+        int algorithm;
+        int channel;
+        int step;
+        int srcRank;
+        int dstRank;
+        size_t dataBytes;
+        int chunkId;
+    };
+    std::vector<P2pTransfer> p2pTraces;
+};
+
 struct ncclComm {
   uint64_t startMagic;
   struct ncclMemoryStack memPermanent, memScoped;
@@ -529,6 +570,8 @@ struct ncclComm {
   struct ncclChannel channels[MAXCHANNELS];
   struct ncclPeerInfo* peerInfo;
   struct ncclTopoSystem* topo;
+  // ADD zhangzhao: pointer to caller-provided mock output buffer for simulation data export (NULL in normal mode)
+  struct ncclMockOutput* mockOutput;
   struct ncclProxyConnector* gproxyConn;
   struct ncclIntruQueue<struct ncclCommCallback, &ncclCommCallback::next> legacyRegCleanupQueue;
   bool peerInfoValid;
