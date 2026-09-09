@@ -677,6 +677,8 @@ ncclResult_t ncclTopoComputePaths(struct ncclTopoSystem* system, struct ncclComm
     NCCLCHECK(ncclTopoSetPaths(system->nodes[NVS].nodes+n, system));
   }
 
+  // MODIFY zhangzhao: skip GPU-Direct P2P/SHM accessibility probing in simulation (no GPU); keep XML-defined paths
+#if 0
   // Update path for GPUs when we don't want to / can't use GPU Direct P2P
   for (int g=0; g<system->nodes[GPU].count; g++) {
     for (int p=0; p<system->nodes[GPU].count; p++) {
@@ -709,6 +711,7 @@ ncclResult_t ncclTopoComputePaths(struct ncclTopoSystem* system, struct ncclComm
       }
     }
   }
+#endif
   // update the GPU -> NIC path in the case of C2C + PHB
   // P2C is only set when the NET is the closest to the GPU. Otherwise PXN connections should be preferred
   for (int g = 0; g < system->nodes[GPU].count; g++) {

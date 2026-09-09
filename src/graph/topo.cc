@@ -1474,6 +1474,8 @@ ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** sy
     NCCLCHECKGOTO(xmlSetAttrInt(top, "version", NCCL_TOPO_XML_VERSION), ret, fail);
   }
 
+  // MODIFY zhangzhao: simulation loads topology purely from static XML; skip all hardware detection and intra-node bootstrap fusion below
+#if 0
   NCCLCHECKGOTO(ncclTopoRefreshBcmP2pLinks(), ret, fail);
 
   // Detect only the GPU managed by this process.  We'll get any others through XML fusion.
@@ -1584,7 +1586,12 @@ ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** sy
   }
 
   // Only update our topo tracking structure if we aren't dumping (separate steps)
-  if (dumpXmlFile == NULL) NCCLCHECKGOTO(ncclTopoGetSystemFromXml(xml, system, getHostHash()), ret, fail);
+#endif
+  // ADD zhangzhao: build topology system directly from the loaded static XML (no hardware probing / fusion)
+  NCCLCHECKGOTO(ncclTopoGetSystemFromXml(xml, system, getHostHash()), ret, fail);
+  // set compCap from XML since commAlloc left it as -1 in simulation
+  comm->compCap = (*system)->nodes[GPU].nodes[0].gpu.cudaCompCap;
+  comm->minCompCap = comm->maxCompCap = comm->compCap;
 
 exit:
   if (!comm->MNNVL && localRanks) free(localRanks);
