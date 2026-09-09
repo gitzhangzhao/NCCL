@@ -59,8 +59,9 @@ ncclResult_t initChannel(struct ncclComm* comm, int channelId) {
   ncclCommPushCudaFree(comm, channel->devRingUserRanks);
 
   /* guarantee addr has been copied into channel->devPeers */
-  NCCLCHECK(ncclStrongStreamRelease(ncclCudaGraphNone(comm->config.graphUsageMode), &sharedRes->deviceStream, /*concurrent=*/false));
-  NCCLCHECK(ncclStrongStreamSynchronize(&sharedRes->deviceStream));
+  // MODIFY zhangzhao: skip GPU stream release/sync in simulation (no GPU)
+  // NCCLCHECK(ncclStrongStreamRelease(ncclCudaGraphNone(comm->config.graphUsageMode), &sharedRes->deviceStream, /*concurrent=*/false));
+  // NCCLCHECK(ncclStrongStreamSynchronize(&sharedRes->deviceStream));
   return ncclSuccess;
 }
 
@@ -102,8 +103,9 @@ ncclResult_t initNvlsChannel(struct ncclComm* comm, int channelId, struct ncclCo
     }
   }
 
-  NCCLCHECK(ncclStrongStreamRelease(ncclCudaGraphNone(comm->config.graphUsageMode), &sharedRes->deviceStream, /*concurrent=*/false));
-  NCCLCHECK(ncclStrongStreamSynchronize(&sharedRes->deviceStream));
+  // MODIFY zhangzhao: skip GPU stream release/sync in simulation (no GPU)
+  // NCCLCHECK(ncclStrongStreamRelease(ncclCudaGraphNone(comm->config.graphUsageMode), &sharedRes->deviceStream, /*concurrent=*/false));
+  // NCCLCHECK(ncclStrongStreamSynchronize(&sharedRes->deviceStream));
 
   return ncclSuccess;
 }
@@ -140,8 +142,9 @@ ncclResult_t initCollnetChannel(struct ncclComm* comm, int channelId, struct ncc
     ncclAtomicRefCountIncrement(&channel->collnetPeers->refCount);
   }
 
-  NCCLCHECK(ncclStrongStreamRelease(ncclCudaGraphNone(comm->config.graphUsageMode), &sharedRes->deviceStream, /*concurrent=*/false));
-  NCCLCHECK(ncclStrongStreamSynchronize(&sharedRes->deviceStream));
+  // MODIFY zhangzhao: skip GPU stream release/sync in simulation (no GPU)
+  // NCCLCHECK(ncclStrongStreamRelease(ncclCudaGraphNone(comm->config.graphUsageMode), &sharedRes->deviceStream, /*concurrent=*/false));
+  // NCCLCHECK(ncclStrongStreamSynchronize(&sharedRes->deviceStream));
 
   return ncclSuccess;
 }

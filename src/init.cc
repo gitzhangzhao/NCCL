@@ -439,10 +439,13 @@ static ncclResult_t commAlloc(struct ncclComm* comm, struct ncclComm* parent, in
     sharedRes->owner = comm;
     sharedRes->tpNRanks = comm->nRanks;
     NCCLCHECK(ncclCalloc(&sharedRes->tpRankToLocalRank, comm->nRanks));
-    NCCLCHECK(ncclStrongStreamConstruct(&sharedRes->deviceStream));
-    NCCLCHECK(ncclStrongStreamConstruct(&sharedRes->hostStream));
-    CUDACHECK(cudaEventCreateWithFlags(&sharedRes->launchEvent, cudaEventDisableTiming));
-    CUDACHECK(cudaEventCreateWithFlags(&sharedRes->scratchEvent, cudaEventDisableTiming));
+    // MODIFY zhangzhao: skip CUDA stream/event creation in mock simulation (no GPU)
+    if (comm->mockOutput == nullptr) {
+      NCCLCHECK(ncclStrongStreamConstruct(&sharedRes->deviceStream));
+      NCCLCHECK(ncclStrongStreamConstruct(&sharedRes->hostStream));
+      CUDACHECK(cudaEventCreateWithFlags(&sharedRes->launchEvent, cudaEventDisableTiming));
+      CUDACHECK(cudaEventCreateWithFlags(&sharedRes->scratchEvent, cudaEventDisableTiming));
+    }
     comm->sharedRes = sharedRes;
     sharedRes->refCount = 1;
     NCCLCHECK(ncclNetInit(comm));
@@ -464,7 +467,9 @@ static ncclResult_t commAlloc(struct ncclComm* comm, struct ncclComm* parent, in
   }
   // Try to create a CUDA object right away. If there is something wrong with
   // the device we're on (failure cause #1) , better know it early.
-  CUDACHECK(cudaGetDevice(&comm->cudaDev));
+  // MODIFY zhangzhao: skip cudaGetDevice in simulation (no GPU); fix cudaDev=0
+  // CUDACHECK(cudaGetDevice(&comm->cudaDev));
+  comm->cudaDev = 0;
 
   // Initialize memory manager
   if (parent && parent->shareResources && parent->memManager) {
@@ -478,16 +483,23 @@ static ncclResult_t commAlloc(struct ncclComm* comm, struct ncclComm* parent, in
     NCCLCHECK(ncclMemManagerInit(comm));
   }
 
-  NCCLCHECK(ncclCudaContextTrack(&comm->context));
+  // MODIFY zhangzhao: skip CUDA context tracking in mock simulation (no GPU driver)
+  if (comm->mockOutput == nullptr) {
+    NCCLCHECK(ncclCudaContextTrack(&comm->context));
+  }
 
-  NCCLCHECK(getBusId(comm->cudaDev, &comm->busId));
+  // MODIFY zhangzhao: skip busId/nvml/compCap hardware queries in simulation; use static values (compCap set from XML)
+  // NCCLCHECK(getBusId(comm->cudaDev, &comm->busId));
+  comm->busId = -1;
   nvmlDevice_t nvmlDev;
   char busId[NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE];
-  NCCLCHECK(int64ToBusId(comm->busId, busId));
-  NCCLCHECK(ncclNvmlDeviceGetHandleByPciBusId(busId, &nvmlDev));
-  NCCLCHECK(ncclNvmlDeviceGetIndex(nvmlDev, (unsigned int*)&comm->nvmlDev));
+  (void)nvmlDev; (void)busId;
+  // NCCLCHECK(int64ToBusId(comm->busId, busId));
+  // NCCLCHECK(ncclNvmlDeviceGetHandleByPciBusId(busId, &nvmlDev));
+  // NCCLCHECK(ncclNvmlDeviceGetIndex(nvmlDev, (unsigned int*)&comm->nvmlDev));
 
-  comm->compCap = ncclCudaCompCap();
+  comm->compCap = -1;
+  // comm->compCap = ncclCudaCompCap();
   TRACE(NCCL_INIT,"comm %p rank %d nranks %d cudaDev %d busId %lx compCap %d", comm, rank, ndev, comm->cudaDev, comm->busId, comm->compCap);
 
   comm->dmaBufSupport = (dmaBufSupported(comm) == ncclSuccess) ? true : false;
@@ -527,16 +539,19 @@ static ncclResult_t commAlloc(struct ncclComm* comm, struct ncclComm* parent, in
 
   comm->regCache.pageSize = ncclOsGetPageSize();
 
-  do {
-    cudaMemPoolProps props = {};
-    props.allocType = cudaMemAllocationTypePinned;
-    props.handleTypes = cudaMemHandleTypeNone;
-    props.location.type = cudaMemLocationTypeDevice;
-    props.location.id = comm->cudaDev;
-    CUDACHECK(cudaMemPoolCreate(&comm->memPool, &props));
-    uint64_t releaseThreshold = ~uint64_t(0);
-    CUDACHECK(cudaMemPoolSetAttribute(comm->memPool, cudaMemPoolAttrReleaseThreshold, &releaseThreshold));
-  } while (0);
+  // MODIFY zhangzhao: skip CUDA memory pool creation in mock simulation (no GPU)
+  if (comm->mockOutput == nullptr) {
+    do {
+      cudaMemPoolProps props = {};
+      props.allocType = cudaMemAllocationTypePinned;
+      props.handleTypes = cudaMemHandleTypeNone;
+      props.location.type = cudaMemLocationTypeDevice;
+      props.location.id = comm->cudaDev;
+      CUDACHECK(cudaMemPoolCreate(&comm->memPool, &props));
+      uint64_t releaseThreshold = ~uint64_t(0);
+      CUDACHECK(cudaMemPoolSetAttribute(comm->memPool, cudaMemPoolAttrReleaseThreshold, &releaseThreshold));
+    } while (0);
+  }
 
   ncclIntruQueueConstruct(&comm->eventCallbackQueue);
 
@@ -669,8 +684,11 @@ static ncclResult_t fillInfo(struct ncclComm* comm, struct ncclPeerInfo* info, u
   info->hostHash=getHostHash()+commHash;
   info->pidHash=getPidHash()+commHash;
   info->cuMemSupport = ncclCuMemEnable();
-  CUDACHECK(cudaGetDeviceProperties(&prop, comm->cudaDev));
-  info->totalGlobalMem = ROUNDUP(prop.totalGlobalMem, (1ULL << 32));
+  // MODIFY zhangzhao: skip cudaGetDeviceProperties in simulation (no GPU); use default 80GB
+  (void)prop;
+  // CUDACHECK(cudaGetDeviceProperties(&prop, comm->cudaDev));
+  // info->totalGlobalMem = ROUNDUP(prop.totalGlobalMem, (1ULL << 32));
+  info->totalGlobalMem = ROUNDUP(((size_t)80 << 30), (1ULL << 32));
 
   // Get the device MAJOR:MINOR of /dev/shm so we can use that
   // information to decide whether we can use SHM for inter-process
@@ -681,10 +699,14 @@ static ncclResult_t fillInfo(struct ncclComm* comm, struct ncclPeerInfo* info, u
 
   info->busId = comm->busId;
 
-  NCCLCHECK(ncclGpuGdrSupport(comm, &info->gdrSupport));
+  // MODIFY zhangzhao: skip GDR support probing in simulation; set from XML default
+  // NCCLCHECK(ncclGpuGdrSupport(comm, &info->gdrSupport));
+  info->gdrSupport = 1;
   info->comm = comm;
   info->cudaCompCap = comm->minCompCap = comm->maxCompCap = comm->compCap;
 
+  // MODIFY zhangzhao: disable MNNVL nvml fabric probing in simulation (no GPU)
+#if 0
   // MNNVL support
   {
     // MNNVL: Request the fabric UUID and partition info
@@ -720,10 +742,12 @@ static ncclResult_t fillInfo(struct ncclComm* comm, struct ncclPeerInfo* info, u
            info->fabricInfo.cliqueId, info->fabricInfo.state, info->fabricInfo.healthMask);
     }
   }
+#endif
 
   NCCLCHECK(ncclTopoCheckCrossNicSupport(&info->crossNicSupport));
-  int cuMemGdrSupport;
-  CUCHECK(cuDeviceGetAttribute(&cuMemGdrSupport, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED, comm->cudaDev));
+  int cuMemGdrSupport = 0;
+  // MODIFY zhangzhao: skip cuDeviceGetAttribute in simulation (no GPU)
+  // CUCHECK(cuDeviceGetAttribute(&cuMemGdrSupport, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED, comm->cudaDev));
   info->cuMemGdrSupport = (cuMemGdrSupport == 1);
   info->supportedGinType = comm->sharedRes->ginState.ginType;
   info->rmaPluginAvailable = (comm->rmaState.rmaProxyState.ncclGin != nullptr);
@@ -900,6 +924,15 @@ static ncclResult_t ncclP2pSchedule(struct ncclComm* comm) {
   return ncclSuccess;
 }
 
+// ADD
+// Author: zhangzhao
+// Date:
+// Mock simulation parameters: NCCL_NUM_MOCK_GPU / NCCL_NUM_MOCK_NODE control the
+// simulated cluster scale for the no-GPU scale-up simulation.
+NCCL_PARAM(NumMockGpu, "NUM_MOCK_GPU", 0);
+NCCL_PARAM(NumMockNode, "NUM_MOCK_NODE", 0);
+#define MOCK_MAX_NODES 1024
+
 static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* parent, uint64_t timers[TIMERS_INIT_COUNT]) {
   // We use 2 AllGathers
   // 1. { peerInfo, comm, compCap}
@@ -953,7 +986,42 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   bool globalRmaPluginSupport = true;
   bool globalCuMemGdrSupport = true;
 
+  // ADD zhangzhao: mock simulation state (no-GPU multi-rank scale-up simulation)
+  int mock_nNodes = ncclParamNumMockNode();
+  int mock_nRanks = ncclParamNumMockGpu();
+  int mock_nRanksPerNode = (mock_nNodes > 0) ? mock_nRanks / mock_nNodes : 0;
+  struct ncclComm* mock_comm = NULL;
+  struct ncclTopoGraph* mock_ringGraph = NULL;
+  struct ncclTopoGraph* mock_treeGraph = NULL;
+  struct ncclTopoGraph* mock_nvlsGraph = NULL;
+  struct ncclTopoGraph* mock_graphs[MOCK_MAX_NODES][NCCL_NUM_ALGORITHMS];
+  struct allGatherInfo* mock_allGather3Data = NULL;
+  struct ncclTopoRanks** mock_allTopoRanks = NULL;
+  int* mock_nChannelsOrig = NULL;
+  int** mock_rings = NULL;
+
   timers[TIMER_INIT_ALLGATHER] = clockNano();
+  // ADD zhangzhao: override rank count and allocate the mock_comm array for simulation
+  if (mock_nRanks > 0) {
+    if (comm->mockOutput != nullptr) comm->mockOutput->mockName = "MockNccl v2.29.7";
+    nranks = mock_nRanks;
+    comm->nRanks = mock_nRanks;
+    INFO(NCCL_MOCK_ROOT, "Mocking start: mock_nNodes(%d), mock_nRanks(%d), mock_nRanksPerNode(%d).", mock_nNodes, mock_nRanks, mock_nRanksPerNode);
+    NCCLCHECKGOTO(ncclCalloc(&mock_comm, mock_nRanks), ret, fail);
+    for (int i = 0; i < mock_nRanks; i++) {
+      mock_comm[i].rank = i;
+      mock_comm[i].nRanks = mock_nRanks;
+      mock_comm[i].nNodes = mock_nNodes;
+      mock_comm[i].mockOutput = comm->mockOutput;
+      struct ncclSharedResources* sharedRes = NULL;
+      NCCLCHECK(ncclCalloc(&sharedRes, 1));
+      sharedRes->owner = &mock_comm[i];
+      sharedRes->tpNRanks = mock_comm[i].nRanks;
+      NCCLCHECK(ncclCalloc(&sharedRes->tpRankToLocalRank, mock_comm[i].nRanks));
+      mock_comm[i].sharedRes = sharedRes;
+      sharedRes->refCount = 1;
+    }
+  }
   // AllGather1 - begin
   NCCLCHECKGOTO(ncclCalloc(&comm->peerInfo, nranks+1), ret, fail); // Extra rank to represent CollNet root
   NCCLCHECKGOTO(fillInfo(comm, comm->peerInfo+rank, comm->commHash), ret, fail);
@@ -961,6 +1029,17 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   COMPILER_ATOMIC_STORE(&comm->peerInfoValid, true, std::memory_order_release);
 
   comm->cuMemSupport = 1;
+  // MODIFY zhangzhao: in single-process mock only rank 0's peerInfo is valid, so the other
+  // entries are all-zero. Skip the cross-rank version/duplicate checks and derive comm-wide
+  // flags from rank 0; keep nNodes=1 (the real node count is computed later from the mock
+  // allGather3Data ringRecv analysis).
+  if (mock_nRanks > 0) {
+    comm->cuMemSupport = comm->peerInfo[rank].cuMemSupport ? 1 : 0;
+    globalGinSupport &= (comm->peerInfo[rank].supportedGinType == comm->sharedRes->ginState.ginType);
+    globalCrossNicSupport &= comm->peerInfo[rank].crossNicSupport;
+    globalRmaPluginSupport &= comm->peerInfo[rank].rmaPluginAvailable;
+    globalCuMemGdrSupport &= comm->peerInfo[rank].cuMemGdrSupport;
+  } else {
   for (int i = 0; i < nranks; i++) {
     if (comm->peerInfo[i].version != comm->peerInfo[rank].version) {
       WARN("Mismatched NCCL version detected : rank %d version %d rank %d version %d",
@@ -980,13 +1059,19 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     globalRmaPluginSupport &= comm->peerInfo[i].rmaPluginAvailable;
     globalCuMemGdrSupport &= comm->peerInfo[i].cuMemGdrSupport;
   }
+  }
   // AllGather1 - end
   timers[TIMER_INIT_ALLGATHER] = clockNano() - timers[TIMER_INIT_ALLGATHER];
+  // ADD zhangzhao: only rank 0 continues to build the full simulated topology graph
+  if (mock_nRanks > 0 && comm->rank != 0) return ncclSuccess;
 
   // Check for MNNVL support
-  NCCLCHECKGOTO(ncclGetUserP2pLevel(&p2pLevel), ret, fail);
-  if ((nNodes > 1 && ncclParamMNNVLEnable() != 0 && p2pLevel != 0) || ncclParamMNNVLEnable() == 1) {
-    NCCLCHECKGOTO(ncclMnnvlCheck(comm), ret, fail);
+  // MODIFY zhangzhao: skip MNNVL detection in mock simulation (ncclMnnvlCheck queries CUDA/NVML)
+  if (mock_nRanks == 0) {
+    NCCLCHECKGOTO(ncclGetUserP2pLevel(&p2pLevel), ret, fail);
+    if ((nNodes > 1 && ncclParamMNNVLEnable() != 0 && p2pLevel != 0) || ncclParamMNNVLEnable() == 1) {
+      NCCLCHECKGOTO(ncclMnnvlCheck(comm), ret, fail);
+    }
   }
 
   do {
@@ -1043,6 +1128,14 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     comm->intraBarrierGate = 0;
   } while(0);
 
+  // ADD zhangzhao: in mock the loop above sees empty peerInfo for ranks>0, which drags
+  // minCompCap down to 0. Fix comm-wide compute capability from rank 0 (default sm_80).
+  if (mock_nRanks > 0) {
+    int cc = comm->peerInfo[rank].cudaCompCap;
+    if (cc <= 0) cc = 80;
+    comm->minCompCap = comm->maxCompCap = cc;
+  }
+
   timers[TIMER_INIT_TOPO] = clockNano();
 
   // Dump XML if requested by user
@@ -1066,6 +1159,21 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   NCCLCHECKGOTO(ncclTopoComputeCommCPU(comm), ret, fail);
   // Print final topology
   NCCLCHECKGOTO(ncclTopoPrint(comm->topo), ret, fail);
+  // ADD zhangzhao: build per-rank topology for every simulated rank (same static XML)
+  if (mock_nRanks > 0) {
+    for (int r = 0; r < mock_nRanks; r++) {
+      NCCLCHECKGOTO(ncclTopoGetSystem(mock_comm+r, &mock_comm[r].topo), ret, fail);
+      NCCLCHECKGOTO(ncclTopoComputePaths(mock_comm[r].topo, mock_comm+r), ret, fail);
+      NCCLCHECKGOTO(ncclTopoTrimSystem(mock_comm[r].topo, mock_comm+r), ret, fail);
+      NCCLCHECKGOTO(ncclTopoComputePaths(mock_comm[r].topo, mock_comm+r), ret, fail);
+      NCCLCHECKGOTO(ncclTopoSearchInit(mock_comm[r].topo), ret, fail);
+      NCCLCHECKGOTO(ncclTopoComputeCommCPU(mock_comm+r), ret, fail);
+      mock_comm[r].minCompCap = comm->minCompCap;
+      mock_comm[r].maxCompCap = comm->maxCompCap;
+      mock_comm[r].nvlsSupport = comm->nvlsSupport;
+      mock_comm[r].config.collnetEnable = comm->config.collnetEnable;
+    }
+  }
   timers[TIMER_INIT_TOPO] = clockNano() - timers[TIMER_INIT_TOPO];
 
   // Set Affinity to a CPU local the our GPU, so that all memory we allocate
@@ -1082,7 +1190,13 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   }
 
   // Determine local Nvls support
-  NCCLCHECK(ncclNvlsInit(comm));
+  // MODIFY zhangzhao: ncclNvlsInit queries the CUDA driver; skip it in mock simulation.
+  // NVLS uses dedicated hardware paths not covered by the P2P trace, so disable it here.
+  if (mock_nRanks > 0) {
+    comm->nvlsSupport = 0;
+  } else {
+    NCCLCHECK(ncclNvlsInit(comm));
+  }
 
   timers[TIMER_INIT_GRAPHS] = clockNano();
   // Get rings and trees
@@ -1131,6 +1245,35 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     NCCLCHECKGOTO(ncclTopoCompute(comm->topo, nvlsGraph), ret, fail);
     NCCLCHECKGOTO(ncclTopoPrintGraph(comm->topo, nvlsGraph), ret, fail);
   }
+  // ADD zhangzhao: build per-node mock topology graphs (copy comm graphs + re-rank intra by node)
+  if (mock_nRanks > 0) {
+    NCCLCHECKGOTO(ncclCalloc(&mock_ringGraph, mock_nNodes), ret, fail);
+    NCCLCHECKGOTO(ncclCalloc(&mock_treeGraph, mock_nNodes), ret, fail);
+    NCCLCHECKGOTO(ncclCalloc(&mock_nvlsGraph, mock_nNodes), ret, fail);
+    for (int i = 0; i < mock_nNodes; i++) {
+      memcpy(&mock_ringGraph[i], ringGraph, sizeof(struct ncclTopoGraph));
+      memcpy(&mock_treeGraph[i], treeGraph, sizeof(struct ncclTopoGraph));
+      memcpy(&mock_nvlsGraph[i], nvlsGraph, sizeof(struct ncclTopoGraph));
+      for (int c = 0; c < mock_ringGraph[i].nChannels; c++)
+        for (int g = 0; g < mock_nRanksPerNode; g++)
+          mock_ringGraph[i].intra[mock_nRanksPerNode*c+g] += mock_nRanksPerNode*i;
+      for (int c = 0; c < mock_treeGraph[i].nChannels; c++)
+        for (int g = 0; g < mock_nRanksPerNode; g++)
+          mock_treeGraph[i].intra[mock_nRanksPerNode*c+g] += mock_nRanksPerNode*i;
+      if (mock_comm[i*mock_nRanksPerNode].nvlsSupport == 1)
+        for (int c = 0; c < mock_nvlsGraph[i].nChannels; c++)
+          mock_nvlsGraph[i].intra[mock_nRanksPerNode*c] += mock_nRanksPerNode*i;
+    }
+    for (int n = 0; n < mock_nNodes; n++) {
+      mock_graphs[n][NCCL_ALGO_TREE] = &mock_treeGraph[n];
+      mock_graphs[n][NCCL_ALGO_RING] = &mock_ringGraph[n];
+      mock_graphs[n][NCCL_ALGO_COLLNET_DIRECT] = collNetDirectGraph;
+      mock_graphs[n][NCCL_ALGO_COLLNET_CHAIN] = collNetChainGraph;
+      mock_graphs[n][NCCL_ALGO_NVLS] = &mock_nvlsGraph[n];
+      mock_graphs[n][NCCL_ALGO_NVLS_TREE] = &mock_nvlsGraph[n];
+      mock_graphs[n][NCCL_ALGO_PAT] = &mock_treeGraph[n];
+    }
+  }
   timers[TIMER_INIT_GRAPHS] = clockNano() - timers[TIMER_INIT_GRAPHS];
 
   // Initialize num P2P LL buffers for this communicator
@@ -1169,7 +1312,35 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   comm->nChannels = std::min(treeGraph->nChannels, ringGraph->nChannels);
   NCCLCHECKGOTO(ncclTopoPreset(comm, graphs, &allGather3Data[rank].topoRanks), ret, fail);
 
-  NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, allGather3Data, sizeof(*allGather3Data)), ret, fail);
+  // ADD zhangzhao: run Preset for every simulated rank and assemble the global allGather3Data
+  // in place of the real bootstrapAllGather (single-process no-GPU simulation).
+  if (mock_nRanks > 0) {
+    NCCLCHECKGOTO(ncclCalloc(&mock_allGather3Data, mock_nRanks), ret, fail);
+    for (int n = 0; n < mock_nRanks; n++) {
+      int nodeIdx = n / mock_nRanksPerNode;
+      for (int a = 0; a < NCCL_NUM_ALGORITHMS; a++) {
+        if (a != NCCL_ALGO_COLLNET_DIRECT && a != NCCL_ALGO_COLLNET_CHAIN) {
+          mock_allGather3Data[n].graphInfo[a].pattern = mock_graphs[nodeIdx][a]->pattern;
+          mock_allGather3Data[n].graphInfo[a].nChannels = mock_graphs[nodeIdx][a]->nChannels;
+          mock_allGather3Data[n].graphInfo[a].sameChannels = mock_graphs[nodeIdx][a]->sameChannels;
+          mock_allGather3Data[n].graphInfo[a].bwIntra = mock_graphs[nodeIdx][a]->bwIntra;
+          mock_allGather3Data[n].graphInfo[a].bwInter = mock_graphs[nodeIdx][a]->bwInter;
+          mock_allGather3Data[n].graphInfo[a].typeIntra = mock_graphs[nodeIdx][a]->typeIntra;
+          mock_allGather3Data[n].graphInfo[a].typeInter = mock_graphs[nodeIdx][a]->typeInter;
+          mock_allGather3Data[n].graphInfo[a].crossNic = mock_graphs[nodeIdx][a]->crossNic;
+        }
+      }
+      mock_allGather3Data[n].cpuArch = comm->cpuArch;
+      mock_allGather3Data[n].cpuVendor = comm->cpuVendor;
+      mock_allGather3Data[n].p2pnChannelsPerPeer = comm->p2pnChannelsPerPeer;
+      mock_allGather3Data[n].nicFused = allGather3Data[rank].nicFused;
+      mock_comm[n].nChannels = comm->nChannels;  // MODIFY zhangzhao: use comm->nChannels (max of all algos) so Preset initializes all channels tree.down=-1
+      NCCLCHECKGOTO(ncclTopoPreset(&mock_comm[n], mock_graphs[nodeIdx], &mock_allGather3Data[n].topoRanks), ret, fail);
+    }
+    memcpy(allGather3Data, mock_allGather3Data, sizeof(*mock_allGather3Data) * mock_nRanks);
+  } else {
+    NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, allGather3Data, sizeof(*allGather3Data)), ret, fail);
+  }
 
   // Determine nNodes, firstRanks, ...
   NCCLCHECKGOTO(ncclCalloc(&nodesFirstRank, nranks), ret, fail);
@@ -1237,6 +1408,35 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   comm->localRank = comm->rankToLocalRank[rank];
   comm->localRanks = comm->nodeRanks[comm->node].localRanks;
 
+  // ADD zhangzhao: replicate node/localRank layout to every simulated rank for its own Postset
+  if (mock_nRanks > 0) {
+    for (int r = 0; r < mock_nRanks; r++) {
+      mock_comm[r].nNodes = comm->nNodes;
+      NCCLCHECKGOTO(ncclCalloc(&mock_comm[r].rankToNode, mock_comm[r].nRanks), ret, fail);
+      memcpy(mock_comm[r].rankToNode, comm->rankToNode, sizeof(int) * mock_comm[r].nRanks);
+      NCCLCHECKGOTO(ncclCalloc(&mock_comm[r].nodeRanks, mock_comm[r].nNodes), ret, fail);
+      NCCLCHECKGOTO(ncclCalloc(&mock_comm[r].rankToLocalRank, mock_comm[r].nRanks), ret, fail);
+      for (int i = 0; i < mock_comm[r].nRanks; i++) {
+        int node = mock_comm[r].rankToNode[i];
+        mock_comm[r].rankToLocalRank[i] = mock_comm[r].nodeRanks[node].localRanks;
+        mock_comm[r].nodeRanks[node].localRanks++;
+      }
+      for (int n = 0; n < mock_comm[r].nNodes; n++) {
+        NCCLCHECKGOTO(ncclCalloc(&mock_comm[r].nodeRanks[n].localRankToRank, mock_comm[r].nodeRanks[n].localRanks), ret, fail);
+        mock_comm[r].maxLocalRanks = std::max(mock_comm[r].maxLocalRanks, mock_comm[r].nodeRanks[n].localRanks);
+        mock_comm[r].nodeRanks[n].localRanks = 0;
+      }
+      for (int j = 0; j < mock_comm[r].nRanks; j++) {
+        int node = mock_comm[r].rankToNode[j];
+        mock_comm[r].nodeRanks[node].localRankToRank[mock_comm[r].nodeRanks[node].localRanks++] = j;
+      }
+      mock_comm[r].node = mock_comm[r].rankToNode[r];
+      mock_comm[r].localRankToRank = mock_comm[r].nodeRanks[mock_comm[r].node].localRankToRank;
+      mock_comm[r].localRank = mock_comm[r].rankToLocalRank[r];
+      mock_comm[r].localRanks = mock_comm[r].nodeRanks[mock_comm[r].node].localRanks;
+    }
+  }
+
   NCCLCHECKGOTO(initNvlDomainInfo(comm), ret, fail);
 
   TRACE(NCCL_INIT,"hostHash[%d] %lx localRank %d localRanks %d localRank0 %d",
@@ -1292,6 +1492,40 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
 
   NCCLCHECKGOTO(ncclCalloc(&rings, nranks*MAXCHANNELS), ret, fail);
   NCCLCHECKGOTO(ncclTopoPostset(comm, nodesFirstRank, nodesTreePatterns, allTopoRanks, rings, graphs, parent), ret, fail);
+  // ADD zhangzhao: run Postset for every simulated rank to connect its channels, and export
+  // the per-rank tree topology into comm->mockOutput for the P2P trace module.
+  if (mock_nRanks > 0) {
+    NCCLCHECKGOTO(ncclCalloc(&mock_nChannelsOrig, mock_nRanks), ret, fail);
+    for (int r = 0; r < mock_nRanks; r++) mock_nChannelsOrig[r] = mock_comm[r].nChannels;
+    NCCLCHECKGOTO(ncclCalloc(&mock_allTopoRanks, mock_nRanks), ret, fail);
+    for (int i = 0; i < mock_nRanks; i++) mock_allTopoRanks[i] = &mock_allGather3Data[i].topoRanks;
+    // FIX zhangzhao: ncclTopoPostset internally doubles nChannels (line 471 of connect.cc:
+    // nChannels = comm->nChannels = min(MAXCHANNELS, nChannels*2)). After the real comm's
+    // Postset at L1494, comm->nChannels is already doubled (e.g. 8→16). We must NOT pass
+    // the doubled value to mock Postset—use the pre-Postset value (mock_nChannelsOrig)
+    // so that connectTrees accesses properly-initialized channels[0..N-1] and [N..2N-1].
+    // Also set config.maxCTAs to prevent Postset's channel-capping (line 509) from
+    // zeroing out nChannels (mock_comm was zero-initialized by ncclCalloc).
+    for (int r = 0; r < mock_nRanks; r++) {
+      mock_comm[r].nChannels = mock_nChannelsOrig[r];  // pre-doubled value (e.g. 8)
+      mock_comm[r].config.maxCTAs = MAXCHANNELS;       // prevent line 509 from clamping to 0
+    }
+    NCCLCHECKGOTO(ncclCalloc(&mock_rings, mock_nRanks), ret, fail);
+    for (int r = 0; r < mock_nRanks; r++) {
+      NCCLCHECKGOTO(ncclCalloc(&mock_rings[r], nranks*MAXCHANNELS), ret, fail);
+      NCCLCHECKGOTO(ncclTopoPostset(mock_comm+r, nodesFirstRank, nodesTreePatterns, mock_allTopoRanks, mock_rings[r], mock_graphs[r/mock_nRanksPerNode], parent), ret, fail);
+    }
+    // After Postset, mock_comm[r].nChannels is doubled (e.g. 16). Export all tree channels.
+    if (comm->mockOutput != nullptr) {
+      int exportChannels = mock_comm[0].nChannels;  // use mock's post-Postset value
+      for (int r = 0; r < mock_nRanks; r++) {
+        for (int c = 0; c < exportChannels; c++) {
+          struct ncclTree* tree = &mock_comm[r].channels[c].tree;
+          comm->mockOutput->treeChannels[c][r] = {tree->up, tree->down[0], tree->down[1], tree->down[2]};
+        }
+      }
+    }
+  }
   // AllGather3 - end
   timers[TIMER_INIT_ALLGATHER] += clockNano() - timers[TIMER_INIT_CONNECT];
 
@@ -1310,6 +1544,16 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
 
   NCCLCHECKGOTO(computeBuffSizes(comm), ret, fail);
   NCCLCHECKGOTO(ncclTopoComputeP2pChannels(comm), ret, fail);
+
+  // ADD zhangzhao: in mock simulation the transport/proxy/devComm stages require real GPUs.
+  // We finish here after exporting the full communication graph to comm->mockOutput.
+  // (enqueue.cc generates the per-step P2P trace from these exported channels.)
+  if (mock_nRanks > 0) {
+    // Compute time models (CPU-only) so enqueue.cc algorithm selection has valid bandwidths.
+    NCCLCHECKGOTO(ncclTopoTuneModel(comm, comm->minCompCap, comm->maxCompCap, graphs), ret, fail);
+    INFO(NCCL_MOCK_ROOT, "Mock simulation: %d coll channels, %d nvls channels, %d p2p channels, %d p2p channels per peer", comm->nChannels, comm->nvlsChannels, comm->p2pnChannels, comm->p2pnChannelsPerPeer);
+    return ncclSuccess;
+  }
 
   /* until now, all info of comm should be known. We can initialize shared resources and
    * map localRanks to top parent local ranks. NOTE: this shareRes init must be put before
@@ -1636,19 +1880,22 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   unsigned long long commIdHash;
 
   timers[TIMER_INIT_TOTAL] = clockNano();
-  CUDACHECKGOTO(cudaSetDevice(cudaDev), res, fail);
-  CUDACHECKGOTO(cudaDeviceGetAttribute(&maxSharedMem, cudaDevAttrMaxSharedMemoryPerBlockOptin, cudaDev), res, fail);
-  CUDACHECKGOTO(cudaDeviceGetAttribute(&archMajor, cudaDevAttrComputeCapabilityMajor, cudaDev), res, fail);
-  CUDACHECKGOTO(cudaDeviceGetAttribute(&archMinor, cudaDevAttrComputeCapabilityMinor, cudaDev), res, fail);
+  // MODIFY zhangzhao: skip CUDA device setup/attr queries in simulation (no GPU); use A100 arch defaults
+  archMajor = 8; archMinor = 0; maxSharedMem = 0;
+  // CUDACHECKGOTO(cudaSetDevice(cudaDev), res, fail);
+  // CUDACHECKGOTO(cudaDeviceGetAttribute(&maxSharedMem, cudaDevAttrMaxSharedMemoryPerBlockOptin, cudaDev), res, fail);
+  // CUDACHECKGOTO(cudaDeviceGetAttribute(&archMajor, cudaDevAttrComputeCapabilityMajor, cudaDev), res, fail);
+  // CUDACHECKGOTO(cudaDeviceGetAttribute(&archMinor, cudaDevAttrComputeCapabilityMinor, cudaDev), res, fail);
   cudaArch = 100*archMajor + 10*archMinor;
 
   timers[TIMER_INIT_KERNELS] = clockNano();
-  NCCLCHECK(ncclInitKernelsForDevice(cudaArch, maxSharedMem, &maxLocalSizeBytes));
+  // MODIFY zhangzhao: skip device kernel init in simulation (no GPU)
+  // NCCLCHECK(ncclInitKernelsForDevice(cudaArch, maxSharedMem, &maxLocalSizeBytes));
   // Set the maximum kernel stack size of all kernels to avoid
   // a CUDA memory reconfig on load (c.f. NVSHMEM issue)
   if (maxLocalSizeBytes > 0 && ncclParamSetStackSize() == 1) {
     TRACE(NCCL_INIT, "Setting cudaLimitStackSize to %zu", maxLocalSizeBytes);
-    CUDACHECKIGNORE(cudaDeviceSetLimit(cudaLimitStackSize, maxLocalSizeBytes));
+    // CUDACHECKIGNORE(cudaDeviceSetLimit(cudaLimitStackSize, maxLocalSizeBytes));
   }
   timers[TIMER_INIT_KERNELS] = clockNano() - timers[TIMER_INIT_KERNELS];
 
@@ -2158,7 +2405,7 @@ static void ncclCommInitJobFree(void* _job) {
   delete job;
 }
 
-static ncclResult_t ncclCommInitRankDev(ncclComm_t* newcomm, int nranks, int nId, ncclUniqueId* commId, int myrank, int cudaDev, ncclConfig_t *config, const char funcName[]) {
+static ncclResult_t ncclCommInitRankDev(ncclComm_t* newcomm, int nranks, int nId, ncclUniqueId* commId, int myrank, int cudaDev, ncclConfig_t *config, const char funcName[], void *mockOutput = nullptr) {
   if (nId <= 0 || nId > nranks) {
     WARN("improper usage of ncclCommInitRank: nId = %d, nranks=%d", nId, nranks);
     return ncclInvalidArgument;
@@ -2176,7 +2423,10 @@ static ncclResult_t ncclCommInitRankDev(ncclComm_t* newcomm, int nranks, int nId
     std::call_once(once, showVersion);
   }
   // Make sure the CUDA runtime is initialized.
-  CUDACHECKGOTO(cudaFree(NULL), res, fail);
+  // MODIFY zhangzhao: skip CUDA runtime init in mock simulation (no GPU/driver available)
+  if (mockOutput == nullptr) {
+    CUDACHECKGOTO(cudaFree(NULL), res, fail);
+  }
 
   NCCLCHECKGOTO(PtrCheck(newcomm, "CommInitRank", "newcomm"), res, fail);
   NCCLCHECKGOTO(PtrCheck(config, "CommInitRank", "config"), res, fail);
@@ -2188,7 +2438,12 @@ static ncclResult_t ncclCommInitRankDev(ncclComm_t* newcomm, int nranks, int nId
 
   NCCLCHECKGOTO(ncclCalloc(&comm, 1), res, fail);
   NCCLCHECKGOTO(ncclCalloc(&comm->abortFlag, 1), res, fail);
-  NCCLCHECKGOTO(ncclCudaHostCalloc(&comm->abortFlagDev, 1), res, fail);
+  // MODIFY zhangzhao: mock simulation has no CUDA pinned memory; use host memory instead
+  if (mockOutput != nullptr) {
+    NCCLCHECKGOTO(ncclCalloc(&comm->abortFlagDev, 1), res, fail);
+  } else {
+    NCCLCHECKGOTO(ncclCudaHostCalloc(&comm->abortFlagDev, 1), res, fail);
+  }
   NCCLCHECKGOTO(ncclCalloc(&comm->abortFlagRefCount, 1), res, fail);
   comm->startMagic = comm->endMagic = NCCL_MAGIC; // Used to detect comm corruption.
   *comm->abortFlagRefCount = 1;
@@ -2196,6 +2451,8 @@ static ncclResult_t ncclCommInitRankDev(ncclComm_t* newcomm, int nranks, int nId
   /* start with ncclInProgress and will be changed to ncclSuccess if init succeeds. */
   comm->initState = ncclInProgress;
   *newcomm = comm;
+  // ADD zhangzhao: attach caller-provided mock output buffer for simulation data export
+  comm->mockOutput = static_cast<struct ncclMockOutput*>(mockOutput);
 
   NEW_NOTHROW_GOTO(job, ncclCommInitRankAsyncJob, res, fail);
   job->nId = nId;
@@ -2257,8 +2514,9 @@ ncclResult_t ncclCommInitRank(ncclComm_t* newcomm, int nranks, ncclUniqueId comm
   return ncclSuccess;
 }
 
-NCCL_API(ncclResult_t, ncclCommInitAll, ncclComm_t* comms, int ndev, const int* devlist);
-ncclResult_t ncclCommInitAll(ncclComm_t* comms, int ndev, const int* devlist) {
+// MODIFY zhangzhao: add mockOutput parameter to collect simulation data
+NCCL_API(ncclResult_t, ncclCommInitAll, ncclComm_t* comms, int ndev, const int* devlist, void *mockOutput);
+ncclResult_t ncclCommInitAll(ncclComm_t* comms, int ndev, const int* devlist, void *mockOutput) {
   ncclResult_t ret = ncclSuccess;
   int totalnDev;
   int *gpuFlags = NULL;
@@ -2268,9 +2526,11 @@ ncclResult_t ncclCommInitAll(ncclComm_t* comms, int ndev, const int* devlist) {
   NVTX3_RANGE(NcclNvtxParamsCommInitAll);
 
   // Load the CUDA driver and dlsym hooks (can fail on old drivers)
-  (void)ncclCudaLibraryInit();
+  // MODIFY zhangzhao: skip CUDA driver library init in simulation
+  // (void)ncclCudaLibraryInit();
 
-  CUDACHECK(cudaGetDevice(&oldDev));
+  // MODIFY zhangzhao: skip cudaGetDevice in simulation (no GPU)
+  // CUDACHECK(cudaGetDevice(&oldDev));
   NCCLCHECKGOTO(PtrCheck(comms, "CommInitAll", "comms"), ret, fail);
   if (ndev < 0) {
     WARN("Invalid device count requested : %d", ndev);
@@ -2278,7 +2538,9 @@ ncclResult_t ncclCommInitAll(ncclComm_t* comms, int ndev, const int* devlist) {
     goto fail;
   }
 
-  CUDACHECKGOTO(cudaGetDeviceCount(&totalnDev), ret, fail);
+  // MODIFY zhangzhao: skip cudaGetDeviceCount in simulation; use requested ndev
+  // CUDACHECKGOTO(cudaGetDeviceCount(&totalnDev), ret, fail);
+  totalnDev = ndev;
   if (devlist) {
     NCCLCHECKGOTO(ncclCalloc(&gpuFlags, totalnDev), ret, fail);
     for (int i = 0; i < ndev; ++i) {
@@ -2307,8 +2569,9 @@ ncclResult_t ncclCommInitAll(ncclComm_t* comms, int ndev, const int* devlist) {
   for (int i=0; i<ndev; i++) {
     // Ignore return codes .. we need to call ncclGroupEnd to clean up anyway
     int dev = devlist ? devlist[i] : i;
-    CUDACHECKGOTO(cudaSetDevice(dev), ret, fail);
-    ncclCommInitRankDev(comms+i, ndev,1, &uniqueId, i, dev, &config, __func__);
+    // MODIFY zhangzhao: skip cudaSetDevice in simulation (no GPU)
+    // CUDACHECKGOTO(cudaSetDevice(dev), ret, fail);
+    ncclCommInitRankDev(comms+i, ndev,1, &uniqueId, i, dev, &config, __func__, mockOutput);
   }
   NCCLCHECKGOTO(ncclGroupEndInternal(), ret, fail);
 
@@ -2316,7 +2579,8 @@ ncclResult_t ncclCommInitAll(ncclComm_t* comms, int ndev, const int* devlist) {
     NVTX3_PAYLOAD(comms[0]->commHash, ndev));
 
 exit:
-  (void)cudaSetDevice(oldDev);
+  // MODIFY zhangzhao: skip cudaSetDevice restore in simulation (no GPU)
+  // (void)cudaSetDevice(oldDev);
   free(gpuFlags);
   return ret;
 fail:
