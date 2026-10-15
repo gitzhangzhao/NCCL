@@ -449,6 +449,24 @@ ncclResult_t ncclTopoPostset(struct ncclComm* comm, int* firstRanks, int* treePa
     channel0->ring.next = channel1->ring.next = ringNext[c*nranks+comm->rank];
   }
 
+  // ADD
+  // Author: zhangzhao
+  // Date:
+  // Export ring topology to mockOutput->ringChannels[channel][rank] = {prev, next, recv, send} for P2P trace.
+  // NCCL duplicates channels later (nChannels*2), so also fill the duplicated half synchronously.
+  if (comm->rank == 0 && comm->mockOutput != nullptr) {
+    for (int c = 0; c < nChannels; c++) {
+      for (int r = 0; r < nranks; r++) {
+        int prev = ringPrev[c * nranks + r];
+        int next = ringNext[c * nranks + r];
+        int recv = ringRecv[c * nNodes + comm->rankToNode[r]];
+        int send = ringSend[c * nNodes + comm->rankToNode[r]];
+        comm->mockOutput->ringChannels[c][r] = {prev, next, recv, send};
+        if (c + nChannels < MAXCHANNELS) comm->mockOutput->ringChannels[c + nChannels][r] = {prev, next, recv, send};
+      }
+    }
+  }
+
   // Duplication should be complete now
   nChannels = comm->nChannels = std::min(MAXCHANNELS,nChannels*2);
 
