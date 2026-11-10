@@ -299,8 +299,9 @@ static ncclResult_t doLaunches(struct ncclComm* head) {
     struct ncclComm* comm = cliqueHead;
     bool capturingYes = false, capturingNo = false;
     do {
-      (ncclCudaGraphValid(comm->planner.capturingGraph) ? capturingYes : capturingNo) = true;
-      CUDACHECKGOTO(cudaSetDevice(comm->cudaDev), result, failure);
+      // MODIFY zhangzhao: skip CUDA graph capture check and device set in simulation (no GPU)
+      // (ncclCudaGraphValid(comm->planner.capturingGraph) ? capturingYes : capturingNo) = true;
+      // CUDACHECKGOTO(cudaSetDevice(comm->cudaDev), result, failure);
       NCCLCHECKGOTO(ncclLaunchPrepare(comm), result, failure);
       if (useBarrier) ncclCommIntraBarrierIn(comm, 1);
       comm = comm->groupNext[ncclGroupTaskTypeCollective];
@@ -332,7 +333,8 @@ static ncclResult_t doLaunches(struct ncclComm* head) {
           struct ncclKernelPlan* plan = comm->planner.unlaunchedPlansHead;
           if (plan != nullptr) {
             comm->planner.unlaunchedPlansHead = plan->next;
-            CUDACHECKGOTO(cudaSetDevice(comm->cudaDev), result, failure);
+            // MODIFY zhangzhao: skip device set in simulation (no GPU)
+            // CUDACHECKGOTO(cudaSetDevice(comm->cudaDev), result, failure);
             NCCLCHECKGOTO(ncclLaunchKernelBefore_NoUncapturedCuda(comm, plan), result, failure);
             if (plan->isCeColl) {
               NCCLCHECKGOTO(ncclLaunchCeColl(comm, plan), result, failure);
@@ -348,7 +350,8 @@ static ncclResult_t doLaunches(struct ncclComm* head) {
             NCCLCHECKGOTO(ncclLaunchKernelAfter_NoCuda(comm, plan), result, failure);
           }
         } else { // Final round.
-          CUDACHECKGOTO(cudaSetDevice(comm->cudaDev), result, failure);
+          // MODIFY zhangzhao: skip device set in simulation (no GPU)
+          // CUDACHECKGOTO(cudaSetDevice(comm->cudaDev), result, failure);
           NCCLCHECKGOTO(ncclLaunchFinish(comm), result, failure);
         }
         comm = next;
@@ -542,7 +545,10 @@ static ncclResult_t ncclPrepareTasksAndCollPreconnect(struct ncclComm* comm, ncc
     bool algoNeedConnect[NCCL_NUM_ALGORITHMS];
     memset(algoNeedConnect, 0, sizeof(bool) * NCCL_NUM_ALGORITHMS);
 
-    CUDACHECK(cudaSetDevice(comm->cudaDev));
+    // MODIFY zhangzhao: skip cudaSetDevice in mock simulation (no GPU driver)
+    if (comm->mockOutput == nullptr) {
+      CUDACHECK(cudaSetDevice(comm->cudaDev));
+    }
     NCCLCHECK(ncclPrepareTasks(comm, algoNeedConnect, &needConnect, simInfo));
 
     if (comm->cuMemSupport && needConnect) {
@@ -572,6 +578,37 @@ static ncclResult_t groupLaunch(struct ncclAsyncJob *job_, ncclSimInfo_t* simInf
   struct ncclGroupJob *gjob = (struct ncclGroupJob*) job_;
   struct ncclComm **groupCommHeadMain = gjob->groupCommHead;
   struct ncclComm *groupCommPreconnectHeadMain = gjob->groupCommPreconnectHead;
+
+  // ADD zhangzhao: MOCK FAST PATH - bypass ALL complex group machinery (async jobs,
+  // preconnect, barriers, doLaunches, stream sync) and only execute the minimal steps
+  // needed to generate P2P traces: PrepareTasks → TasksRegAndEnqueue → LaunchPrepare.
+  {
+    struct ncclComm* comm = groupCommHeadMain[ncclGroupTaskTypeCollective];
+    if (comm != nullptr && comm->mockOutput != nullptr) {
+      WARN("Mock fast path: entering groupLaunch mock bypass");
+      // 1. Compute algorithm/protocol for collective tasks
+      bool needConnect = false;
+      bool algoNeedConnect[NCCL_NUM_ALGORITHMS];
+      memset(algoNeedConnect, 0, sizeof(bool) * NCCL_NUM_ALGORITHMS);
+      if ((ret = ncclPrepareTasks(comm, algoNeedConnect, &needConnect, simInfo)) != ncclSuccess) return ret;
+      WARN("Mock fast path: ncclPrepareTasks done");
+      // 2. Build device work structures from tasks
+      if ((ret = ncclTasksRegAndEnqueue(comm)) != ncclSuccess) return ret;
+      WARN("Mock fast path: ncclTasksRegAndEnqueue done");
+      // 3. Schedule tasks to plan (P2P trace hook fires inside scheduleCollTasksToPlan)
+      if ((ret = ncclLaunchPrepare(comm)) != ncclSuccess) return ret;
+      WARN("Mock fast path: ncclLaunchPrepare done");
+      // 4. Clean up: leave group and pop memory scope
+      do {
+        struct ncclComm* next = comm->groupNext[ncclGroupTaskTypeCollective];
+        (void)ncclGroupCommLeave(comm, ncclGroupTaskTypeCollective);
+        groupCommHeadMain[ncclGroupTaskTypeCollective] = next;
+        comm = next;
+      } while (comm != nullptr);
+      WARN("Mock fast path: cleanup done, returning");
+      return ncclSuccess;
+    }
+  }
   struct ncclIntruQueue<struct ncclAsyncJob, &ncclAsyncJob::next> *asyncJobsMain = &gjob->asyncJobs;
   bool *groupAbortFlag = &gjob->abortFlag;
 
@@ -658,7 +695,10 @@ static ncclResult_t groupLaunch(struct ncclAsyncJob *job_, ncclSimInfo_t* simInf
     // done with all buffer allocation, start registration and enqueue
     comm = groupCommHeadMain[ncclGroupTaskTypeCollective];
     do {
-      CUDACHECKGOTO(cudaSetDevice(comm->cudaDev), ret, fail);
+      // MODIFY zhangzhao: skip cudaSetDevice in mock simulation (no GPU driver)
+      if (comm->mockOutput == nullptr) {
+        CUDACHECKGOTO(cudaSetDevice(comm->cudaDev), ret, fail);
+      }
       NCCLCHECKGOTO(ncclTasksRegAndEnqueue(comm), ret, fail);
       comm = comm->groupNext[ncclGroupTaskTypeCollective];
     } while (comm);
@@ -692,7 +732,15 @@ static ncclResult_t groupLaunch(struct ncclAsyncJob *job_, ncclSimInfo_t* simInf
   }
 
   if ((!simInfo) && (groupCommHeadMain[ncclGroupTaskTypeCollective] != nullptr)) {
-    NCCLCHECKGOTO(doLaunches(groupCommHeadMain[ncclGroupTaskTypeCollective]), ret, fail);
+    // MODIFY zhangzhao: In mock simulation, only run ncclLaunchPrepare to generate
+    // P2P traces (via scheduleCollTasksToPlan). Skip the full doLaunches which has
+    // complex barrier/kernel-launch/stream-sync logic that requires a real GPU.
+    struct ncclComm* firstComm = groupCommHeadMain[ncclGroupTaskTypeCollective];
+    if (firstComm->mockOutput != nullptr) {
+      NCCLCHECKGOTO(ncclLaunchPrepare(firstComm), ret, fail);
+    } else {
+      NCCLCHECKGOTO(doLaunches(groupCommHeadMain[ncclGroupTaskTypeCollective]), ret, fail);
+    }
   }
 
   while (!ncclIntruQueueEmpty(asyncJobsMain)) {
@@ -828,10 +876,11 @@ ncclResult_t ncclGroupEndInternal(ncclSimInfo_t* simInfo) {
       ret = ncclInProgress;
     } else {
       /* blocking group */
-      int savedDev;
-      CUDACHECKGOTO(cudaGetDevice(&savedDev), ret, fail);
+      int savedDev = 0;
+      // MODIFY zhangzhao: skip save/restore device in simulation (no GPU)
+      // CUDACHECKGOTO(cudaGetDevice(&savedDev), ret, fail);
       NCCLCHECKGOTO(groupLaunch(&groupJob->base, internalSimInfoPtr), ret, fail);
-      CUDACHECKGOTO(cudaSetDevice(savedDev), ret, fail);
+      // CUDACHECKGOTO(cudaSetDevice(savedDev), ret, fail);
       if (simInfo) memcpy((void*)simInfo, (void*)internalSimInfoPtr, realSize);
       delete groupJob;
     }
