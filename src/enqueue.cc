@@ -104,6 +104,8 @@ static inline int ncclFuncTrafficPerByte(ncclFunc_t func, int nRanks) {
 /*****************************************************************************/
 
 ncclResult_t ncclAddProxyOpIfNeeded(struct ncclComm* comm, struct ncclKernelPlan* plan, struct ncclProxyOp* op) {
+  // ADD zhangzhao: skip proxy ops in mock simulation (transport layer not initialized)
+  if (comm->mockOutput != nullptr) return ncclSuccess;
   bool needed = true;
   NCCLCHECK(ncclProxySaveOp(comm, op, &needed));
   if (needed) {
@@ -312,7 +314,10 @@ ncclResult_t ncclTasksRegAndEnqueue(struct ncclComm* comm) {
       workNode = ncclIntruQueueDequeue(&planner->tmpCollWorkQueue);
       goto next;
     }
-    ncclRegisterCollBuffers(comm, task, regBufSend, regBufRecv, &planner->collCleanupQueue, &regNeedConnect);
+    // MODIFY zhangzhao: skip GPU buffer registration in mock simulation (buffers are NULL)
+    if (comm->mockOutput == nullptr) {
+      ncclRegisterCollBuffers(comm, task, regBufSend, regBufRecv, &planner->collCleanupQueue, &regNeedConnect);
+    }
 
     devWork.sendbuff = (void*)task->sendbuff;
     devWork.recvbuff = (void*)task->recvbuff;
@@ -1569,6 +1574,13 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
           budget.inArgsBytes = comm->workArgsBytes - sizeof(struct ncclDevKernelArgs);
           // Non-persistent kernels fill up at most half of our fifo per kernel.
           budget.outArgsBytes = plan->persistent ? (1<<30) : comm->workFifoBytes/2;
+          // MODIFY zhangzhao: in mock simulation workArgsBytes/workFifoBytes may be too small
+          // (depends on cudaArch which is partially mocked). Use unlimited budget to ensure
+          // all tasks get scheduled and drained, preventing infinite do-while loop.
+          if (comm->mockOutput != nullptr) {
+            budget.inArgsBytes = 1 << 30;
+            budget.outArgsBytes = 1 << 30;
+          }
 
           // Drain coll tasks first. This is essential since we partition tasks based
           // on the work budget and p2p work isn't collective. If we were to drain p2p
@@ -1601,6 +1613,14 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
     planner->unlaunchedPlansHead = planHead;
 
     if (nPlans == 0) return ncclSuccess;
+
+    // ADD zhangzhao: In mock simulation, P2P traces have been generated during
+    // scheduleCollTasksToPlan above. Skip all GPU stream synchronization and kernel launch.
+    // Clear unlaunchedPlansHead so doLaunches() won't iterate over plans trying to launch.
+    if (comm->mockOutput != nullptr) {
+      planner->unlaunchedPlansHead = nullptr;
+      return ncclSuccess;
+    }
 
     cudaStream_t launchStream = planner->streams->stream;
     cudaStream_t deviceStream, launchOrder;
@@ -1676,6 +1696,9 @@ NCCL_PARAM(MemSyncDomain, "MEM_SYNC_DOMAIN", cudaLaunchMemSyncDomainRemote);
 
 ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan) {
   ncclResult_t ret = ncclSuccess;
+  // ADD zhangzhao: in mock simulation there is no GPU kernel to launch. The communication
+  // plan and its P2P trace have already been recorded during scheduling, so finish here.
+  if (comm->mockOutput != nullptr) return ncclSuccess;
   struct ncclKernelPlanner* planner = &comm->planner;
   int nChannels = countOneBits(plan->channelMask);
   void* sym = plan->kernelFn;
@@ -1801,6 +1824,8 @@ namespace {
 }
 
 ncclResult_t ncclLaunchFinish(struct ncclComm* comm) {
+  // ADD zhangzhao: skip stream sync/event recording in mock simulation (no GPU)
+  if (comm->mockOutput != nullptr) return ncclSuccess;
   struct ncclKernelPlanner* planner = &comm->planner;
   if (!ncclIntruQueueEmpty(&planner->planQueue)) {
     // Reset queue to empty without destroying plans since those will be sent
@@ -2449,6 +2474,8 @@ static ncclResult_t hostToDevRedOp(
 }
 
 static ncclResult_t ncclPlannerSetCapturingGraph(struct ncclComm* comm, struct ncclInfo* info) {
+  // ADD zhangzhao: skip CUDA graph capture check in mock simulation (no GPU driver available)
+  if (comm->mockOutput != nullptr) return ncclSuccess;
   struct ncclKernelPlanner *planner = &comm->planner;
   if (info->stream != planner->streamRecent || planner->streams == nullptr) {
     planner->streamRecent = info->stream;
@@ -2931,8 +2958,11 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
         bool captured = false;
         struct ncclCudaGraph graph;
         // For cuda graph checking
-        NCCLCHECK(ncclCudaGetCapturingGraph(&graph, info->stream, comm->config.graphUsageMode));
-        captured = ncclCudaGraphValid(graph);
+        // MODIFY zhangzhao: skip CUDA graph capture check in mock simulation
+        if (comm->mockOutput == nullptr) {
+          NCCLCHECK(ncclCudaGetCapturingGraph(&graph, info->stream, comm->config.graphUsageMode));
+          captured = ncclCudaGraphValid(graph);
+        }
         if (info->coll == ncclFuncAlltoAll) {
           NCCLCHECK(ncclRegFind(comm, info->sendbuff, comm->nRanks * info->count * ncclTypeSize(info->datatype), &sendReg));
           NCCLCHECK(ncclRegFind(comm, info->recvbuff, comm->nRanks * info->count * ncclTypeSize(info->datatype), &recvReg));
