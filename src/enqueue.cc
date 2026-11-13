@@ -20,6 +20,7 @@
 #include "scheduler.h"
 #include "compiler.h"
 #include "rma/rma.h"
+#include "p2p_trace.h"  // ADD zhangzhao: fine-grained P2P transfer trace for mock simulation
 
 #include <cstring> // std::memcpy
 #include <cinttypes> // PRIx64
@@ -725,6 +726,24 @@ static ncclResult_t scheduleCollTasksToPlan(
         devWork->cbd.chunkGrainsMid = chunkSize/grainSize;
       }
       devWork->direct = directFlags;
+
+      // ADD zhangzhao: emit fine-grained P2P transfer trace + record collective plan info
+      // for the mock simulation (rank 0 holds the global mockOutput).
+      if (comm->rank == 0 && comm->mockOutput != nullptr) {
+        int traceChunkCount = (elementSize != 0) ? (int)(chunkSize / elementSize) : 0;
+        size_t tracePerChannelCount = (countLo != 0) ? countLo : ((countHi != 0) ? countHi : countMid);
+        NCCLCHECK(traceCollP2pOps(comm, (int)task->func, task->algorithm,
+                                  traceChunkCount, task->datatype, task->root,
+                                  tracePerChannelCount, nChannels));
+        struct ncclMockOutput::CollInfo ci = {};
+        ci.algo = task->algorithm;
+        ci.protocol = task->protocol;
+        ci.nchannels = nChannels;
+        ci.chunkCount = traceChunkCount;
+        ci.chunkSize = (int)chunkSize;
+        ci.workCount = tracePerChannelCount;
+        comm->mockOutput->collInfos[task->func][task->count*elementSize] = ci;
+      }
 
       // Update the current channel and vacant traffic budget.
       if (countHi != 0) {
